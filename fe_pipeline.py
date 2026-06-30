@@ -22,6 +22,7 @@ CSV format
 """
 
 import csv
+import hashlib
 import os
 import re
 import sys
@@ -369,13 +370,26 @@ def _charge_and_mult(mol):
     return charge, n_rad + 1
 
 
+def _sanitize_filename(smi):
+    clean = re.sub(r'[^a-zA-Z0-9_-]', '_', smi)
+    if len(clean) > 30:
+        clean = clean[:30]
+    smi_hash = hashlib.md5(smi.encode('utf-8')).hexdigest()[:6]
+    return f"{clean}_{smi_hash}"
+
+
 # =============================================================================
 #  STEP 4 -- GFN2-xTB optimisation + quasi-RRHO thermochemistry
 # =============================================================================
 
 def step4_xtb_optimize_and_thermo(ensembles, solvent="water",
                                    temperature=TEMPERATURE, pressure=PRESSURE,
-                                   fmax=0.01, vib_delta=0.01):
+                                   fmax=0.01, vib_delta=0.01,
+                                   output_dir=None, save_geoms=False,
+                                   vib_dir=None):
+    # vib_dir: base directory for Vibrations cache files.
+    # In parallel mode each worker passes its own tempdir to avoid
+    # race conditions between processes writing to the same CWD.
     """
     Input : {smiles: [ase.Atoms, ...]}
     Output: {smiles: [{G, H, S_total, E_elec, ZPE, ...}, ...]}
@@ -411,19 +425,38 @@ def step4_xtb_optimize_and_thermo(ensembles, solvent="water",
 
             opt = LBFGS(atoms, logfile=None)
             opt.run(fmax=fmax)
+
+            if save_geoms and output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                smi_clean = _sanitize_filename(smi)
+                geom_filename = f"{smi_clean}_conf{i}.xyz"
+                geom_filepath = os.path.join(output_dir, geom_filename)
+                ase_write(geom_filepath, atoms)
+                print(f"      Optimized geometry saved to {geom_filepath}")
+
             E_elec_ev = atoms.get_potential_energy()
             print(f"      E_elec   = {E_elec_ev:.6f} eV  ({E_elec_ev * EV_TO_KCAL:.4f} kcal/mol)")
 
-            vib = Vibrations(atoms, delta=vib_delta, name=f"vib_{i}")
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                vib.run()
+            # Unique name per molecule+conformer to avoid stale cache
+            # conflicts when different molecules share the same index (vib_0).
+            # In parallel mode vib_dir is a per-worker tempdir so processes
+            # never write to the same path simultaneously.
+            vib_name = f"vib_{_sanitize_filename(smi)}_{i}"
+            if vib_dir:
+                vib_name = os.path.join(vib_dir, vib_name)
+            vib = Vibrations(atoms, delta=vib_delta, name=vib_name)
+            try:
+                vib.clean()  # remove stale files from any previous crashed run
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    vib.run()
+                raw_freqs = vib.get_frequencies()
+            finally:
+                vib.clean()  # always clean up, even if get_frequencies() raises
 
-            raw_freqs  = vib.get_frequencies()
             real_freqs = [abs(f.real) for f in raw_freqs
                           if abs(f.imag) < 1.0 and f.real > 10.0]
             n_imag = sum(1 for f in raw_freqs if f.real < -10.0)
-            vib.clean()
 
             print(f"      frequencies: {len(real_freqs)} real  |  {n_imag} imaginary")
             if real_freqs:
@@ -664,25 +697,39 @@ def step6_compute_profile(reactions, g_eff):
 # =============================================================================
 
 def step7_plot(profiles, unit="kcal/mol", step_width=0.6, step_gap=0.5,
-               output="free_energy_profile.png"):
+               output_dir="."):
     """
     Input : profiles from Step 6
-    Output: PNG staircase plot
+    Output: one PNG per reaction, saved as {output_dir}/{rxn_id}.png
+
+    If `profiles` is empty (e.g. every reaction failed upstream), this
+    function prints a clear error and returns without calling matplotlib,
+    instead of crashing inside plt.subplots with nrows=0.
     """
     print("\n" + SEP)
     print("  STEP 7 -- Staircase plot")
     print(SEP)
-    print(f"  INPUT : {len(profiles)} profile(s)  ->  {output}")
+    print(f"  INPUT : {len(profiles)} profile(s)  ->  {output_dir}/{{rxn_id}}.png")
 
-    n_rxns = len(profiles)
-    fig, axes = plt.subplots(n_rxns, 1, figsize=(10, 5 * n_rxns), squeeze=False)
+    if not profiles:
+        print("  ERROR: no profiles to plot -- every reaction failed in an "
+              "earlier step (see Step 4/5/6 output above for the root cause).")
+        print("  Skipping plot generation.")
+        return
 
-    for ax, (rxn_id, profile) in zip(axes[:, 0], profiles.items()):
+    saved = []
+    for rxn_id, profile in profiles.items():
         valid   = [s for s in profile if s["dG"] is not None]
         dGs     = [s["dG"]        for s in valid]
         labels  = [s["label"]     for s in valid]
         mols    = [s["molecules"] for s in valid]
         n       = len(dGs)
+
+        if n == 0:
+            print(f"  WARNING: {rxn_id} has no valid states to plot -- skipping.")
+            continue
+
+        fig, ax = plt.subplots(figsize=(max(8, n * 2), 5))
 
         pitch     = step_width + step_gap
         x_centers = np.arange(n) * pitch
@@ -725,10 +772,14 @@ def step7_plot(profiles, unit="kcal/mol", step_width=0.6, step_gap=0.5,
         ax.set_title(f"Free Energy Profile -- {rxn_id}", fontsize=12, fontweight="bold")
         ax.spines[["top", "right", "bottom"]].set_visible(False)
 
-    plt.tight_layout()
-    plt.savefig(output, dpi=150, bbox_inches="tight")
-    print(f"\n  OUTPUT: saved to {output}")
+        plt.tight_layout()
+        out_path = os.path.join(output_dir, f"{rxn_id}.png")
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(out_path)
+        print(f"    saved: {out_path}")
 
+    print(f"\n  OUTPUT: {len(saved)} plot(s) saved to {output_dir}/")
 
 
 # =============================================================================
@@ -742,23 +793,31 @@ def _process_molecule(args):
     Designed to be called by ProcessPoolExecutor -- must be top-level and
     accept a single argument (pickling requirement).
 
-    args : tuple of (smi, rdkit_mol, solvent, crest_binary, n_cores_crest)
+    args : tuple of (smi, rdkit_mol, solvent, crest_binary, n_cores_crest, output_dir, save_geoms)
+
+    Each worker creates its own temporary directory for Vibrations cache files
+    so that parallel processes never write to the same path simultaneously.
     """
-    smi, rdmol, solvent, crest_binary, n_cores_crest = args
+    smi, rdmol, solvent, crest_binary, n_cores_crest, output_dir, save_geoms = args
 
-    # Step 3 for this molecule only
-    single_ensemble = step3_crest_sampling(
-        {smi: rdmol},
-        solvent=solvent,
-        n_cores=n_cores_crest,
-        crest_binary=crest_binary,
-    )
+    with tempfile.TemporaryDirectory(prefix="vib_worker_") as vib_dir:
 
-    # Step 4 for this molecule only
-    single_thermo = step4_xtb_optimize_and_thermo(
-        single_ensemble,
-        solvent=solvent,
-    )
+        # Step 3 for this molecule only
+        single_ensemble = step3_crest_sampling(
+            {smi: rdmol},
+            solvent=solvent,
+            n_cores=n_cores_crest,
+            crest_binary=crest_binary,
+        )
+
+        # Step 4 for this molecule only -- vib files go into the worker tempdir
+        single_thermo = step4_xtb_optimize_and_thermo(
+            single_ensemble,
+            solvent=solvent,
+            output_dir=output_dir,
+            save_geoms=save_geoms,
+            vib_dir=vib_dir,
+        )
 
     return smi, single_thermo.get(smi, [])
 
@@ -768,7 +827,8 @@ def _process_molecule(args):
 # =============================================================================
 
 def run_pipeline(csv_path, solvent="water", crest_binary="crest",
-                 parallel=False, n_workers=4, n_cores_crest=2):
+                 parallel=False, n_workers=4, n_cores_crest=2,
+                 output_dir=".", save_geoms=False):
     """
     Parameters
     ----------
@@ -779,7 +839,22 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
     n_workers     : number of parallel processes (parallel=True only)
     n_cores_crest : CPU cores given to each CREST call; when parallel=True,
                     set so that n_workers * n_cores_crest <= total cores
+    output_dir    : directory to save output files (plot and optimized conformers)
+    save_geoms    : if True, save optimized conformer geometries in output_dir
     """
+    if not ASE_AVAILABLE:
+        print("\n" + SEP)
+        print("  FATAL: ASE/tblite import failed at startup (see "
+              "[IMPORT WARNING] above).")
+        print("  Steps 4-7 cannot run without ASE/tblite. Check that you are "
+              "using the correct Python interpreter/conda environment:")
+        print("    which python")
+        print("    python -c \"from tblite.ase import TBLite; print('OK')\"")
+        print(SEP)
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     reactions     = step0_parse_csv(csv_path)
     unique_smiles = step1_extract_unique_molecules(reactions)
     step1b_check_atom_balance(reactions)
@@ -794,7 +869,7 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
 
         thermo = {}
         args_list = [
-            (smi, mol_3d[smi], solvent, crest_binary, n_cores_crest)
+            (smi, mol_3d[smi], solvent, crest_binary, n_cores_crest, output_dir, save_geoms)
             for smi in unique_smiles
         ]
 
@@ -816,27 +891,54 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
         ensembles = step3_crest_sampling(mol_3d, solvent=solvent,
                                           crest_binary=crest_binary,
                                           n_cores=n_cores_crest)
-        thermo    = step4_xtb_optimize_and_thermo(ensembles, solvent=solvent)
+        thermo    = step4_xtb_optimize_and_thermo(ensembles, solvent=solvent,
+                                                  output_dir=output_dir,
+                                                  save_geoms=save_geoms)
 
     g_eff    = step5_boltzmann_aggregate(thermo)
     profiles = step6_compute_profile(reactions, g_eff)
-    step7_plot(profiles)
+
+    step7_plot(profiles, output_dir=output_dir or ".")
 
     return profiles
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python fe_pipeline.py reactions.csv [solvent] [crest_binary] [parallel] [n_workers] [n_cores_crest]")
-        sys.exit(1)
+    # Check if any argument starts with "-" to determine if we use flags or positional arguments
+    use_flags = any(arg.startswith("-") for arg in sys.argv[1:])
 
-    csv_path     = sys.argv[1]
-    solvent      = sys.argv[2] if len(sys.argv) > 2 else "water"
-    crest_binary = sys.argv[3] if len(sys.argv) > 3 else "crest"
-    parallel     = sys.argv[4].lower() in ("true", "1", "yes") if len(sys.argv) > 4 else False
-    n_workers    = int(sys.argv[5]) if len(sys.argv) > 5 else 4
-    n_cores_crest = int(sys.argv[6]) if len(sys.argv) > 6 else 2
+    if use_flags or len(sys.argv) == 1:
+        import argparse
+        parser = argparse.ArgumentParser(description="Modular free energy profile pipeline for reaction pathways.")
+        parser.add_argument("reactions_csv", help="Path to reactions CSV file")
+        parser.add_argument("--solvent", default="water", help="Solvent name for CREST/xTB, or 'none' for gas phase (default: water)")
+        parser.add_argument("--crest-binary", default="crest", help="Path or name of the CREST executable (default: crest)")
+        parser.add_argument("--parallel", action="store_true", help="Run Steps 3+4 in parallel across molecules")
+        parser.add_argument("--n-workers", type=int, default=4, help="Number of parallel processes (default: 4)")
+        parser.add_argument("--n-cores-crest", type=int, default=2, help="CPU cores given to each CREST call (default: 2)")
+        parser.add_argument("--output-dir", default=".", help="Directory to save plots and optimized geometries (default: .)")
+        parser.add_argument("--save-geoms", action="store_true", help="Save the optimized conformer geometries as XYZ files in the output directory")
+
+        args = parser.parse_args()
+        csv_path      = args.reactions_csv
+        solvent       = args.solvent
+        crest_binary  = args.crest_binary
+        parallel      = args.parallel
+        n_workers     = args.n_workers
+        n_cores_crest = args.n_cores_crest
+        output_dir    = args.output_dir
+        save_geoms    = args.save_geoms
+    else:
+        csv_path      = sys.argv[1]
+        solvent       = sys.argv[2] if len(sys.argv) > 2 else "water"
+        crest_binary  = sys.argv[3] if len(sys.argv) > 3 else "crest"
+        parallel      = sys.argv[4].lower() in ("true", "1", "yes") if len(sys.argv) > 4 else False
+        n_workers     = int(sys.argv[5]) if len(sys.argv) > 5 else 4
+        n_cores_crest = int(sys.argv[6]) if len(sys.argv) > 6 else 2
+        output_dir    = sys.argv[7] if len(sys.argv) > 7 else "."
+        save_geoms    = sys.argv[8].lower() in ("true", "1", "yes") if len(sys.argv) > 8 else False
 
     run_pipeline(csv_path, solvent=solvent, crest_binary=crest_binary,
                  parallel=parallel, n_workers=n_workers,
-                 n_cores_crest=n_cores_crest)
+                 n_cores_crest=n_cores_crest, output_dir=output_dir,
+                 save_geoms=save_geoms)

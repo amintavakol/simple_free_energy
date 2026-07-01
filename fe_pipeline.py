@@ -72,14 +72,16 @@ SEP = "-" * 60
 def step0_parse_csv(csv_path):
     """
     Input : path to CSV file
-    Output: list of reaction dicts
+    Output: (list of reaction dicts, parse_failures {rxn_id: reason})
     """
     print("\n" + SEP)
     print("  STEP 0 -- Parse CSV")
     print(SEP)
     print(f"  INPUT : {csv_path}")
 
-    reactions = []
+    reactions     = []
+    parse_failures = {}   # {rxn_id: reason}
+
     with open(csv_path, newline="") as f:
         reader = csv.reader(f)
         for row in reader:
@@ -89,18 +91,31 @@ def step0_parse_csv(csv_path):
             rxn_str = row[1].strip().strip('"')
             raw_states = rxn_str.split(">>")
             states = []
+            parse_ok = True
             for i, state_str in enumerate(raw_states):
-                raw_mols = _split_state_smiles(state_str.strip())
-                states.append({"label": f"State_{i}", "raw_smiles": raw_mols})
-            reactions.append({"rxn_id": rxn_id, "states": states})
+                try:
+                    raw_mols = _split_state_smiles(state_str.strip())
+                    states.append({"label": f"State_{i}", "raw_smiles": raw_mols})
+                except ValueError as exc:
+                    reason = f"Invalid SMILES in State_{i}: {exc}"
+                    print(f"  ERROR [{rxn_id}] {reason}")
+                    parse_failures[rxn_id] = reason
+                    parse_ok = False
+                    break
+            if parse_ok:
+                reactions.append({"rxn_id": rxn_id, "states": states})
 
-    print(f"\n  OUTPUT: {len(reactions)} reaction(s) parsed")
+    n_ok     = len(reactions)
+    n_failed = len(parse_failures)
+    print(f"\n  OUTPUT: {n_ok} reaction(s) parsed  |  {n_failed} failed to parse")
     for rxn in reactions:
         print(f"\n  [{rxn['rxn_id']}]")
         for s in rxn["states"]:
             print(f"    {s['label']:10s} -> {s['raw_smiles']}")
+    for rxn_id, reason in parse_failures.items():
+        print(f"\n  [FAILED] {rxn_id}: {reason}")
 
-    return reactions
+    return reactions, parse_failures
 
 
 def _split_state_smiles(state_smiles):
@@ -246,38 +261,50 @@ def step2_generate_3d(unique_smiles):
     print(SEP)
     print(f"  INPUT : {len(unique_smiles)} SMILES")
 
-    mol_3d = {}
+    mol_3d     = {}
+    embed_failures = {}   # {smiles: reason}
+
     for smi in unique_smiles:
-        mol = Chem.MolFromSmiles(smi)
-        mol = Chem.AddHs(mol)
+        try:
+            mol = Chem.MolFromSmiles(smi)
+            mol = Chem.AddHs(mol)
 
-        params = AllChem.ETKDGv3()
-        params.randomSeed = 42
-        result = AllChem.EmbedMolecule(mol, params)
-        if result == -1:
-            warnings.warn(f"ETKDGv3 failed for {smi!r}, trying ETKDG.")
-            AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+            params = AllChem.ETKDGv3()
+            params.randomSeed = 42
+            result = AllChem.EmbedMolecule(mol, params)
+            if result == -1:
+                warnings.warn(f"ETKDGv3 failed for {smi!r}, trying ETKDG.")
+                result = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+            if result == -1:
+                raise RuntimeError("3D embedding failed with both ETKDGv3 and ETKDG")
 
-        ff = AllChem.MMFFGetMoleculeForceField(
-            mol, AllChem.MMFFGetMoleculeProperties(mol)
-        )
-        if ff:
-            ff.Minimize(maxIts=2000)
-        else:
-            AllChem.UFFOptimizeMolecule(mol, maxIters=2000)
+            ff = AllChem.MMFFGetMoleculeForceField(
+                mol, AllChem.MMFFGetMoleculeProperties(mol)
+            )
+            if ff:
+                ff.Minimize(maxIts=2000)
+            else:
+                AllChem.UFFOptimizeMolecule(mol, maxIters=2000)
 
-        mol_3d[smi] = mol
-        conf   = mol.GetConformer()
-        coords = conf.GetPositions()
-        n_heavy = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() != 1)
-        print(f"\n  [{smi}]")
-        print(f"    heavy atoms : {n_heavy}")
-        print(f"    total atoms : {mol.GetNumAtoms()}")
-        print(f"    centroid    : ({coords[:,0].mean():.2f}, "
-              f"{coords[:,1].mean():.2f}, {coords[:,2].mean():.2f}) A")
+            mol_3d[smi] = mol
+            conf   = mol.GetConformer()
+            coords = conf.GetPositions()
+            n_heavy = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() != 1)
+            print(f"\n  [{smi}]")
+            print(f"    heavy atoms : {n_heavy}")
+            print(f"    total atoms : {mol.GetNumAtoms()}")
+            print(f"    centroid    : ({coords[:,0].mean():.2f}, "
+                  f"{coords[:,1].mean():.2f}, {coords[:,2].mean():.2f}) A")
 
-    print(f"\n  OUTPUT: 3D mols for {len(mol_3d)} molecule(s)")
-    return mol_3d
+        except Exception as exc:
+            reason = f"3D embedding failed: {type(exc).__name__}: {exc}"
+            print(f"\n  [{smi}]")
+            print(f"    ERROR: {reason}")
+            embed_failures[smi] = reason
+
+    n_failed = len(embed_failures)
+    print(f"\n  OUTPUT: 3D mols for {len(mol_3d)} molecule(s)  |  {n_failed} failure(s)")
+    return mol_3d, embed_failures
 
 
 # =============================================================================
@@ -862,14 +889,20 @@ def _process_molecule(args):
 #  FAILURE REPORT
 # =============================================================================
 
-def write_failure_report(rxn_failures, mol_failures, output_dir="."):
+def write_failure_report(rxn_failures, mol_failures,
+                         parse_failures=None, output_dir="."):
     """
     Write a plain-text failure report listing every reaction that could not
     produce a plot, with the specific molecule(s) and error reason(s).
+    Covers three failure categories:
+      1. SMILES parsing errors (Step 0)
+      2. xTB computation failures (Step 4)
+      3. Reactions with no plottable profile (Step 6)
 
     Output: {output_dir}/failed_reactions.txt
     """
-    if not rxn_failures and not mol_failures:
+    parse_failures = parse_failures or {}
+    if not rxn_failures and not mol_failures and not parse_failures:
         return
 
     report_path = os.path.join(output_dir, "failed_reactions.txt")
@@ -879,25 +912,49 @@ def write_failure_report(rxn_failures, mol_failures, output_dir="."):
         "",
     ]
 
-    if rxn_failures:
-        lines.append(f"REACTIONS WITHOUT PLOTS ({len(rxn_failures)})")
+    if parse_failures:
+        lines.append(f"SMILES PARSE ERRORS -- Step 0 ({len(parse_failures)})")
         lines.append("-" * 60)
-        for rxn_id, reason in rxn_failures.items():
+        lines.append("  These reactions were skipped entirely because one or more")
+        lines.append("  state SMILES could not be parsed by RDKit. Common causes:")
+        lines.append("  invalid valence (e.g. [ClH2-]), unsupported notation,")
+        lines.append("  or a typo in the SMILES string.")
+        lines.append("")
+        for rxn_id, reason in parse_failures.items():
             lines.append(f"  {rxn_id}")
             lines.append(f"    Reason : {reason}")
             lines.append("")
 
     if mol_failures:
-        lines.append(f"MOLECULES THAT FAILED IN xTB ({len(mol_failures)})")
+        lines.append(f"xTB COMPUTATION FAILURES -- Step 4 ({len(mol_failures)})")
         lines.append("-" * 60)
+        lines.append("  These molecules were parsed successfully but failed during")
+        lines.append("  GFN2-xTB geometry optimization or Hessian calculation.")
+        lines.append("  Common causes: unusual bonding (e.g. covalent C-Na),")
+        lines.append("  wrong charge/spin state, or unsupported element.")
+        lines.append("")
         for smi, reason in mol_failures.items():
             lines.append(f"  SMILES : {smi}")
             lines.append(f"  Reason : {reason}")
             lines.append("")
 
+    if rxn_failures:
+        lines.append(f"REACTIONS WITHOUT PLOTS -- Step 6 ({len(rxn_failures)})")
+        lines.append("-" * 60)
+        lines.append("  These reactions had valid SMILES but could not produce a")
+        lines.append("  plot because one or more states had missing G values.")
+        lines.append("")
+        for rxn_id, reason in rxn_failures.items():
+            lines.append(f"  {rxn_id}")
+            lines.append(f"    Reason : {reason}")
+            lines.append("")
+
     lines.append("=" * 60)
-    lines.append("Tip: check SMILES validity, charge/spin state, and whether")
-    lines.append("xTB supports the elements in your molecule.")
+    lines.append("General tips:")
+    lines.append("  - Verify SMILES: python -c \"from rdkit import Chem; print(Chem.MolFromSmiles('YOUR_SMILES'))\"")
+    lines.append("  - Check atom balance in Step 1b console output.")
+    lines.append("  - Use explicit charge notation: [Na+], [Cl-], [C-]#N")
+    lines.append("  - Avoid covalent ionic bonds: C(#N)[Na] should be [Na+].[C-]#N")
 
     os.makedirs(output_dir, exist_ok=True)
     with open(report_path, "w") as f:
@@ -939,10 +996,12 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    reactions     = step0_parse_csv(csv_path)
+    reactions, parse_failures = step0_parse_csv(csv_path)
     unique_smiles = step1_extract_unique_molecules(reactions)
     step1b_check_atom_balance(reactions)
-    mol_3d        = step2_generate_3d(unique_smiles)
+    mol_3d, embed_failures = step2_generate_3d(unique_smiles)
+    # embed_failures feeds into mol_failures so they appear in the report
+    # and cause the affected reactions to be skipped in step6
 
     if parallel:
         print("\n" + SEP)
@@ -952,10 +1011,11 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
         print(f"  total cores used <= {n_workers * n_cores_crest}")
 
         thermo       = {}
-        mol_failures = {}
+        mol_failures = dict(embed_failures)   # carry forward 3D failures
+        # only dispatch molecules that were successfully embedded
         args_list = [
             (smi, mol_3d[smi], solvent, crest_binary, n_cores_crest, output_dir, save_geoms)
-            for smi in unique_smiles
+            for smi in unique_smiles if smi in mol_3d
         ]
 
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -979,17 +1039,41 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
         ensembles = step3_crest_sampling(mol_3d, solvent=solvent,
                                           crest_binary=crest_binary,
                                           n_cores=n_cores_crest)
-        thermo, mol_failures = step4_xtb_optimize_and_thermo(
+        thermo, xtb_failures = step4_xtb_optimize_and_thermo(
             ensembles, solvent=solvent,
             output_dir=output_dir, save_geoms=save_geoms)
+        mol_failures = {**embed_failures, **xtb_failures}
 
     g_eff             = step5_boltzmann_aggregate(thermo)
     profiles, rxn_failures = step6_compute_profile(reactions, g_eff, mol_failures)
-    write_failure_report(rxn_failures, mol_failures, output_dir=output_dir or ".")
+    write_failure_report(rxn_failures, mol_failures,
+                         parse_failures=parse_failures,
+                         output_dir=output_dir or ".")
 
     step7_plot(profiles, output_dir=output_dir or ".")
 
     return profiles
+
+
+def run_pipeline_safe(csv_path, **kwargs):
+    """
+    Wrapper around run_pipeline that catches any unexpected top-level exception,
+    writes it to failed_reactions.txt, and exits cleanly instead of crashing.
+    Use this entry point when running large batches.
+    """
+    output_dir = kwargs.get("output_dir", ".")
+    try:
+        return run_pipeline(csv_path, **kwargs)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        print(f"\n  FATAL PIPELINE ERROR: {reason}")
+        write_failure_report(
+            rxn_failures={},
+            mol_failures={},
+            parse_failures={"PIPELINE": reason},
+            output_dir=output_dir,
+        )
+        return {}
 
 
 if __name__ == "__main__":
@@ -1027,7 +1111,7 @@ if __name__ == "__main__":
         output_dir    = sys.argv[7] if len(sys.argv) > 7 else "."
         save_geoms    = sys.argv[8].lower() in ("true", "1", "yes") if len(sys.argv) > 8 else False
 
-    run_pipeline(csv_path, solvent=solvent, crest_binary=crest_binary,
-                 parallel=parallel, n_workers=n_workers,
-                 n_cores_crest=n_cores_crest, output_dir=output_dir,
-                 save_geoms=save_geoms)
+    run_pipeline_safe(csv_path, solvent=solvent, crest_binary=crest_binary,
+                      parallel=parallel, n_workers=n_workers,
+                      n_cores_crest=n_cores_crest, output_dir=output_dir,
+                      save_geoms=save_geoms)

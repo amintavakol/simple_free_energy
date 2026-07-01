@@ -390,6 +390,8 @@ def step4_xtb_optimize_and_thermo(ensembles, solvent="water",
     # vib_dir: base directory for Vibrations cache files.
     # In parallel mode each worker passes its own tempdir to avoid
     # race conditions between processes writing to the same CWD.
+    # Returns (thermo_results, mol_failures) where mol_failures is a
+    # dict {smiles: reason_string} for molecules that could not be computed.
     """
     Input : {smiles: [ase.Atoms, ...]}
     Output: {smiles: [{G, H, S_total, E_elec, ZPE, ...}, ...]}
@@ -401,9 +403,10 @@ def step4_xtb_optimize_and_thermo(ensembles, solvent="water",
 
     if not ASE_AVAILABLE:
         print("  ERROR: ASE/tblite not available. Cannot run Step 4.")
-        return {}
+        return {}, {"ALL": "ASE/tblite not available"}
 
     thermo_results = {}
+    mol_failures   = {}   # {smiles: reason}
 
     for smi, conformers in ensembles.items():
         charge, mult = _get_charge_mult_from_smi(smi)
@@ -413,68 +416,80 @@ def step4_xtb_optimize_and_thermo(ensembles, solvent="water",
         for i, atoms in enumerate(conformers):
             if isinstance(atoms, Chem.rdchem.Mol):
                 print(f"    Conformer {i}: RDKit placeholder -- skipping xTB.")
+                mol_failures[smi] = "ASE not available at runtime; RDKit placeholder used"
                 continue
 
             print(f"\n    -- Conformer {i} --")
 
-            atoms = atoms.copy()
-            xtb_kwargs = dict(method="GFN2-xTB", charge=charge, multiplicity=mult)
-            if solvent.lower() != "none":
-                xtb_kwargs["solvent"] = solvent
-            atoms.calc = XTB(**xtb_kwargs)
-
-            opt = LBFGS(atoms, logfile=None)
-            opt.run(fmax=fmax)
-
-            if save_geoms and output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                smi_clean = _sanitize_filename(smi)
-                geom_filename = f"{smi_clean}_conf{i}.xyz"
-                geom_filepath = os.path.join(output_dir, geom_filename)
-                ase_write(geom_filepath, atoms)
-                print(f"      Optimized geometry saved to {geom_filepath}")
-
-            E_elec_ev = atoms.get_potential_energy()
-            print(f"      E_elec   = {E_elec_ev:.6f} eV  ({E_elec_ev * EV_TO_KCAL:.4f} kcal/mol)")
-
-            # Unique name per molecule+conformer to avoid stale cache
-            # conflicts when different molecules share the same index (vib_0).
-            # In parallel mode vib_dir is a per-worker tempdir so processes
-            # never write to the same path simultaneously.
-            vib_name = f"vib_{_sanitize_filename(smi)}_{i}"
-            if vib_dir:
-                vib_name = os.path.join(vib_dir, vib_name)
-            vib = Vibrations(atoms, delta=vib_delta, name=vib_name)
             try:
-                vib.clean()  # remove stale files from any previous crashed run
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    vib.run()
-                raw_freqs = vib.get_frequencies()
-            finally:
-                vib.clean()  # always clean up, even if get_frequencies() raises
+                atoms = atoms.copy()
+                xtb_kwargs = dict(method="GFN2-xTB", charge=charge, multiplicity=mult)
+                if solvent.lower() != "none":
+                    xtb_kwargs["solvent"] = solvent
+                atoms.calc = XTB(**xtb_kwargs)
 
-            real_freqs = [abs(f.real) for f in raw_freqs
-                          if abs(f.imag) < 1.0 and f.real > 10.0]
-            n_imag = sum(1 for f in raw_freqs if f.real < -10.0)
+                opt = LBFGS(atoms, logfile=None)
+                opt.run(fmax=fmax)
 
-            print(f"      frequencies: {len(real_freqs)} real  |  {n_imag} imaginary")
-            if real_freqs:
-                print(f"      freq range : {min(real_freqs):.1f} - {max(real_freqs):.1f} cm-1")
+                if save_geoms and output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    smi_clean = _sanitize_filename(smi)
+                    geom_filename = f"{smi_clean}_conf{i}.xyz"
+                    geom_filepath = os.path.join(output_dir, geom_filename)
+                    ase_write(geom_filepath, atoms)
+                    print(f"      Optimized geometry saved to {geom_filepath}")
 
-            thermo = _quasi_rrho_thermo(atoms, E_elec_ev, real_freqs,
-                                        temperature, pressure)
-            mol_thermo.append(thermo)
+                E_elec_ev = atoms.get_potential_energy()
+                print(f"      E_elec   = {E_elec_ev:.6f} eV  ({E_elec_ev * EV_TO_KCAL:.4f} kcal/mol)")
 
-            print(f"      ZPE      = {thermo['ZPE']:.4f} kcal/mol")
-            print(f"      H        = {thermo['H']:.4f} kcal/mol")
-            print(f"      S*T      = {thermo['S_total'] * temperature:.4f} kcal/mol")
-            print(f"      G        = {thermo['G']:.4f} kcal/mol")
+                # Unique name per molecule+conformer to avoid stale cache
+                # conflicts when different molecules share the same index (vib_0).
+                # In parallel mode vib_dir is a per-worker tempdir so processes
+                # never write to the same path simultaneously.
+                vib_name = f"vib_{_sanitize_filename(smi)}_{i}"
+                if vib_dir:
+                    vib_name = os.path.join(vib_dir, vib_name)
+                vib = Vibrations(atoms, delta=vib_delta, name=vib_name)
+                try:
+                    vib.clean()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        vib.run()
+                    raw_freqs = vib.get_frequencies()
+                finally:
+                    vib.clean()
+
+                real_freqs = [abs(f.real) for f in raw_freqs
+                              if abs(f.imag) < 1.0 and f.real > 10.0]
+                n_imag = sum(1 for f in raw_freqs if f.real < -10.0)
+
+                print(f"      frequencies: {len(real_freqs)} real  |  {n_imag} imaginary")
+                if real_freqs:
+                    print(f"      freq range : {min(real_freqs):.1f} - {max(real_freqs):.1f} cm-1")
+
+                thermo = _quasi_rrho_thermo(atoms, E_elec_ev, real_freqs,
+                                            temperature, pressure)
+                mol_thermo.append(thermo)
+
+                print(f"      ZPE      = {thermo['ZPE']:.4f} kcal/mol")
+                print(f"      H        = {thermo['H']:.4f} kcal/mol")
+                print(f"      S*T      = {thermo['S_total'] * temperature:.4f} kcal/mol")
+                print(f"      G        = {thermo['G']:.4f} kcal/mol")
+
+            except Exception as exc:
+                reason = f"xTB failed for conformer {i}: {type(exc).__name__}: {exc}"
+                print(f"      ERROR: {reason}")
+                mol_failures[smi] = reason
 
         thermo_results[smi] = mol_thermo
 
-    print(f"\n  OUTPUT: thermo data for {len(thermo_results)} molecule(s)")
-    return thermo_results
+    n_failed = len(mol_failures)
+    print(f"\n  OUTPUT: thermo data for {len(thermo_results)} molecule(s)"
+          f"  |  {n_failed} failure(s)")
+    if n_failed:
+        for smi, reason in mol_failures.items():
+            print(f"    FAILED: {smi}  ->  {reason}")
+    return thermo_results, mol_failures
 
 
 def _get_charge_mult_from_smi(smi):
@@ -633,40 +648,57 @@ def step5_boltzmann_aggregate(thermo_results, temperature=TEMPERATURE):
 #  STEP 6 -- dG profile per reaction
 # =============================================================================
 
-def step6_compute_profile(reactions, g_eff):
+def step6_compute_profile(reactions, g_eff, mol_failures=None):
     """
-    Input : reactions, g_eff {smiles: G_eff}
-    Output: {rxn_id: [{label, dG, ddG, molecules, G_abs}, ...]}
+    Input : reactions, g_eff {smiles: G_eff}, mol_failures {smiles: reason}
+    Output: (profiles dict, rxn_failures dict {rxn_id: reason})
     """
     print("\n" + SEP)
     print("  STEP 6 -- Compute dG profiles")
     print(SEP)
     print(f"  INPUT : {len(reactions)} reaction(s), {len(g_eff)} molecule G values")
 
-    profiles = {}
+    profiles    = {}
+    rxn_failures = {}
+    mol_failures = mol_failures or {}
 
     for rxn in reactions:
         rxn_id = rxn["rxn_id"]
         states = rxn["states"]
         print(f"\n  [{rxn_id}]")
 
-        state_G = []
+        state_G        = []
+        failed_mols    = []
         for state in states:
             mols    = state.get("smiles", state["raw_smiles"])
             missing = [m for m in mols if m not in g_eff]
             if missing:
+                failed_reasons = [
+                    f"{m}: {mol_failures.get(m, 'G not computed')}"
+                    for m in missing
+                ]
                 print(f"    WARNING: missing G for {missing} in {state['label']}")
                 state_G.append(None)
+                failed_mols.extend(failed_reasons)
             else:
                 state_G.append(sum(g_eff[m] for m in mols))
 
         valid_Gs = [g for g in state_G if g is not None]
         if not valid_Gs:
+            reason = f"No G values computed. Failed molecules: {'; '.join(failed_mols)}"
             print(f"    ERROR: no G values for {rxn_id} -- skipping.")
-            print(f"           Check that Step 4 completed successfully.")
+            rxn_failures[rxn_id] = reason
             continue
 
-        G0      = valid_Gs[0]
+        if state_G[0] is None:
+            reason = (f"State_0 (reference) could not be computed. "
+                      f"Failed molecules: {'; '.join(failed_mols)}")
+            print(f"    ERROR: State_0 (reference) is missing G values for {rxn_id} -- skipping.")
+            print(f"           The reference state must be computable. Fix the reactant SMILES.")
+            rxn_failures[rxn_id] = reason
+            continue
+
+        G0      = state_G[0]
         profile = []
         prev_dg = 0.0
         for state, G_abs in zip(states, state_G):
@@ -688,8 +720,9 @@ def step6_compute_profile(reactions, g_eff):
 
         profiles[rxn_id] = profile
 
-    print(f"\n  OUTPUT: profiles for {len(profiles)} reaction(s)")
-    return profiles
+    print(f"\n  OUTPUT: profiles for {len(profiles)} reaction(s)"
+          f"  |  {len(rxn_failures)} failure(s)")
+    return profiles, rxn_failures
 
 
 # =============================================================================
@@ -811,7 +844,7 @@ def _process_molecule(args):
         )
 
         # Step 4 for this molecule only -- vib files go into the worker tempdir
-        single_thermo = step4_xtb_optimize_and_thermo(
+        single_thermo, single_failures = step4_xtb_optimize_and_thermo(
             single_ensemble,
             solvent=solvent,
             output_dir=output_dir,
@@ -819,7 +852,58 @@ def _process_molecule(args):
             vib_dir=vib_dir,
         )
 
-    return smi, single_thermo.get(smi, [])
+    thermo_list   = single_thermo.get(smi, [])
+    worker_failures = single_failures if single_failures else {}
+    return smi, thermo_list, worker_failures
+
+
+
+# =============================================================================
+#  FAILURE REPORT
+# =============================================================================
+
+def write_failure_report(rxn_failures, mol_failures, output_dir="."):
+    """
+    Write a plain-text failure report listing every reaction that could not
+    produce a plot, with the specific molecule(s) and error reason(s).
+
+    Output: {output_dir}/failed_reactions.txt
+    """
+    if not rxn_failures and not mol_failures:
+        return
+
+    report_path = os.path.join(output_dir, "failed_reactions.txt")
+    lines = [
+        "Simple Reaction Thermo -- Failure Report",
+        "=" * 60,
+        "",
+    ]
+
+    if rxn_failures:
+        lines.append(f"REACTIONS WITHOUT PLOTS ({len(rxn_failures)})")
+        lines.append("-" * 60)
+        for rxn_id, reason in rxn_failures.items():
+            lines.append(f"  {rxn_id}")
+            lines.append(f"    Reason : {reason}")
+            lines.append("")
+
+    if mol_failures:
+        lines.append(f"MOLECULES THAT FAILED IN xTB ({len(mol_failures)})")
+        lines.append("-" * 60)
+        for smi, reason in mol_failures.items():
+            lines.append(f"  SMILES : {smi}")
+            lines.append(f"  Reason : {reason}")
+            lines.append("")
+
+    lines.append("=" * 60)
+    lines.append("Tip: check SMILES validity, charge/spin state, and whether")
+    lines.append("xTB supports the elements in your molecule.")
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(report_path, "w") as f:
+        f.write("\n".join(lines))
+
+    print(f"\n  Failure report written to: {report_path}")
 
 
 # =============================================================================
@@ -867,7 +951,8 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
         print(f"  n_workers={n_workers}  n_cores_crest={n_cores_crest}")
         print(f"  total cores used <= {n_workers * n_cores_crest}")
 
-        thermo = {}
+        thermo       = {}
+        mol_failures = {}
         args_list = [
             (smi, mol_3d[smi], solvent, crest_binary, n_cores_crest, output_dir, save_geoms)
             for smi in unique_smiles
@@ -881,22 +966,26 @@ def run_pipeline(csv_path, solvent="water", crest_binary="crest",
             for future in as_completed(futures):
                 smi = futures[future]
                 try:
-                    smi_out, thermo_list = future.result()
+                    smi_out, thermo_list, worker_failures = future.result()
                     thermo[smi_out] = thermo_list
+                    mol_failures.update(worker_failures)
                     print(f"  DONE: {smi}")
                 except Exception as e:
-                    print(f"  ERROR: {smi} -> {e}")
+                    reason = f"{type(e).__name__}: {e}"
+                    print(f"  ERROR: {smi} -> {reason}")
                     thermo[smi] = []
+                    mol_failures[smi] = reason
     else:
         ensembles = step3_crest_sampling(mol_3d, solvent=solvent,
                                           crest_binary=crest_binary,
                                           n_cores=n_cores_crest)
-        thermo    = step4_xtb_optimize_and_thermo(ensembles, solvent=solvent,
-                                                  output_dir=output_dir,
-                                                  save_geoms=save_geoms)
+        thermo, mol_failures = step4_xtb_optimize_and_thermo(
+            ensembles, solvent=solvent,
+            output_dir=output_dir, save_geoms=save_geoms)
 
-    g_eff    = step5_boltzmann_aggregate(thermo)
-    profiles = step6_compute_profile(reactions, g_eff)
+    g_eff             = step5_boltzmann_aggregate(thermo)
+    profiles, rxn_failures = step6_compute_profile(reactions, g_eff, mol_failures)
+    write_failure_report(rxn_failures, mol_failures, output_dir=output_dir or ".")
 
     step7_plot(profiles, output_dir=output_dir or ".")
 
